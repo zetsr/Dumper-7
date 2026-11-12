@@ -111,21 +111,18 @@ void FName::Init_Windows(bool bForceGNames)
 	if ((!AppendString || bFoundPotentiallyOverlappingSig) && !bForceGNames && StringRef)
 	{
 		/*
-		* 0x00: 8B ? ?          mov     ecx, [...]
-		* 0x03: E8 ? ? ? ?      call    FName::GetComparisonNameEntry
-		* 0x08: 48 8D ? ?       lea     rdx, [...]
-		* 0x0B: 48 8B C8        mov     rcx, rax
-		* 0x10: E8 ? ? ? ?      call    FNameEntry::GetName
+		* 'GetNameEntryCallAddress' points at the 'call FName::GetComparisonNameEntry' instruction and
+		* 'GetNameCallAddress' at the 'call FNameEntry::GetName' instruction of an inlined FName::AppendString.
 		*/
-		if (void* SigScanResult = Platform::FindPatternInRange("8B ? ? E8 ? ? ? ? 48 8D ? ? ? 48 8B C8 E8 ? ? ? ?", StringRef, 0x180))
+		auto InitInlinedAppendString = [](const uintptr_t GetNameEntryCallAddress, const uintptr_t GetNameCallAddress) -> void
 		{
-			const uintptr_t ResultAsInt = reinterpret_cast<const uintptr_t>(SigScanResult);
-
-			GetNameEntryFromName = reinterpret_cast<decltype(GetNameEntryFromName)>(Architecture_x86_64::Resolve32BitRelativeCall(ResultAsInt + 0x3));
-			AppendString = reinterpret_cast<decltype(AppendString)>(Architecture_x86_64::Resolve32BitRelativeCall(ResultAsInt + 0x10));
+			GetNameEntryFromName = reinterpret_cast<decltype(GetNameEntryFromName)>(Architecture_x86_64::Resolve32BitRelativeCall(GetNameEntryCallAddress));
+			AppendString = reinterpret_cast<decltype(AppendString)>(Architecture_x86_64::Resolve32BitRelativeCall(GetNameCallAddress));
 
 			Off::InSDK::Name::GetNameEntryFromName = Platform::GetOffset(GetNameEntryFromName);
 			Off::InSDK::Name::bIsAppendStringInlinedAndUsed = true;
+
+			std::cerr << std::format("FName::AppendString is inlined, found 'FName::GetComparisonNameEntry' at offset 0x{:X}\n", Off::InSDK::Name::GetNameEntryFromName);
 
 			ToStr = [](const void* Name) -> std::wstring
 			{
@@ -143,6 +140,67 @@ void FName::Init_Windows(bool bForceGNames)
 
 				return OutputString;
 			};
+		};
+
+		/*
+		* 0x00: 8B ? ?          mov     ecx, [...]
+		* 0x03: E8 ? ? ? ?      call    FName::GetComparisonNameEntry
+		* 0x08: 48 8D ? ?       lea     rdx, [...]
+		* 0x0B: 48 8B C8        mov     rcx, rax
+		* 0x10: E8 ? ? ? ?      call    FNameEntry::GetName
+		*/
+		if (void* SigScanResult = Platform::FindPatternInRange("8B ? ? E8 ? ? ? ? 48 8D ? ? ? 48 8B C8 E8 ? ? ? ?", StringRef, 0x180))
+		{
+			const uintptr_t ResultAsInt = reinterpret_cast<const uintptr_t>(SigScanResult);
+
+			InitInlinedAppendString(ResultAsInt + 0x3, ResultAsInt + 0x10);
+		}
+		else
+		{
+			/*
+			* Some UE5.8 builds load 'FName::ComparisonIndex' into 'ecx' with a 2-byte register move, which the signature above
+			* can't match. The tail of the inlined FName::AppendString is still stable, and because 'call' is always the
+			* instruction right before the 'lea', 'FName::GetComparisonNameEntry' can be resolved without knowing how 'ecx'
+			* was loaded.
+			*
+			* 0x00: 8B CB            mov     ecx, ebx
+			* 0x02: E8 ? ? ? ?       call    FName::GetComparisonNameEntry
+			* 0x07: 48 8D 54 24 30   lea     rdx, [rsp + 0x30]
+			* 0x0C: 48 8B C8         mov     rcx, rax
+			* 0x0F: E8 ? ? ? ?       call    FNameEntry::GetName
+			*/
+			struct InlinedAppendStringTail
+			{
+				const char* Signature;
+				int32 LeaInstructionSize;
+			};
+
+			constexpr std::array InlinedAppendStringTails =
+			{
+				InlinedAppendStringTail{ "48 8D ? ? ? 48 8B C8 E8", 0x5 }, // lea rdx, [rsp + 0x30]
+				InlinedAppendStringTail{ "48 8D ? ? 48 8B C8 E8",   0x4 }  // lea rdx, [rbp - 0x40]
+			};
+
+			constexpr int32 CallInstructionSize = 0x5;
+			constexpr int32 MovRcxRaxInstructionSize = 0x3;
+
+			for (const InlinedAppendStringTail& Tail : InlinedAppendStringTails)
+			{
+				const void* SigScanResult = Platform::FindPatternInRange(Tail.Signature, StringRef, 0x180);
+
+				if (!SigScanResult)
+					continue;
+
+				const uintptr_t ResultAsInt = reinterpret_cast<const uintptr_t>(SigScanResult);
+				const uintptr_t GetNameEntryCallAddress = ResultAsInt - CallInstructionSize;
+
+				/* Make sure the bytes before the 'lea' are actually a relative call, and not the last bytes of an unrelated read. */
+				if (*reinterpret_cast<const uint8*>(GetNameEntryCallAddress) != 0xE8)
+					continue;
+
+				InitInlinedAppendString(GetNameEntryCallAddress, ResultAsInt + Tail.LeaInstructionSize + MovRcxRaxInstructionSize);
+				break;
+			}
 		}
 	}
 
